@@ -1,0 +1,52 @@
+name: Update contributors
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # daily at 03:00 UTC
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/contributors.yml"
+      - "scripts/update-contributors.mjs"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-contributors
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Collect outside collaborators
+        env:
+          # Must be an org owner's PAT with the read:org scope: the default
+          # GITHUB_TOKEN is not allowed to list outside collaborators.
+          GITHUB_TOKEN: ${{ secrets.ORG_TOKEN }}
+          ORG: Godawari-Hacks
+          README_PATH: README.md,profile/README.md
+          PER_ROW: "6"
+          EXCLUDE: ""
+          INCLUDE: "Manish-Tamang"
+        run: node scripts/update-contributors.mjs
+
+      - name: Commit changes
+        run: |
+          if [ -z "$(git status --porcelain -- README.md profile/README.md assets/avatars)" ]; then
+            echo "No collaborator changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md profile/README.md assets/avatars
+          git commit -m "chore: update outside collaborators"
+          git push

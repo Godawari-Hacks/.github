@@ -1,0 +1,216 @@
+#!/usr/bin/env node
+// Builds the outside-collaborators section of the org README:
+// the people listed under "Outside collaborators" on the org's People page,
+// plus anyone named in INCLUDE.
+
+const ORG = process.env.ORG || "Godawari-Hacks";
+const TOKEN = process.env.GITHUB_TOKEN;
+const README_PATHS = (process.env.README_PATH || "README.md,profile/README.md")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const PER_ROW = Number(process.env.PER_ROW || 6);
+const AVATAR = Number(process.env.AVATAR_SIZE || 64);
+const RADIUS = Number(process.env.AVATAR_RADIUS || 4);
+const AVATAR_DIR = "assets/avatars";
+const logins = (v) =>
+  (v || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+const EXCLUDE = new Set(logins(process.env.EXCLUDE).map((s) => s.toLowerCase()));
+const INCLUDE = logins(process.env.INCLUDE);
+
+const START = "<!-- CONTRIBUTORS:START -->";
+const END = "<!-- CONTRIBUTORS:END -->";
+
+if (!TOKEN) {
+  console.error("GITHUB_TOKEN is required");
+  process.exit(1);
+}
+
+async function api(path, { allowMissing = false } = {}) {
+  const url = path.startsWith("http") ? path : `https://api.github.com${path}`;
+  const res = await fetch(url, {
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${TOKEN}`,
+      "x-github-api-version": "2022-11-28",
+      "user-agent": `${ORG}-contributors-workflow`,
+    },
+  });
+
+  if (res.status === 204) return { data: [], next: null };
+  if (!res.ok) {
+    if (allowMissing && (res.status === 404 || res.status === 403)) {
+      return { data: null, next: null };
+    }
+    throw new Error(`${res.status} ${res.statusText} for ${url}\n${await res.text()}`);
+  }
+
+  const link = res.headers.get("link") || "";
+  const next = /<([^>]+)>;\s*rel="next"/.exec(link)?.[1] ?? null;
+  return { data: await res.json(), next };
+}
+
+async function paginate(path) {
+  const out = [];
+  let url = `${path}${path.includes("?") ? "&" : "?"}per_page=100`;
+  while (url) {
+    const { data, next } = await api(url);
+    out.push(...data);
+    url = next;
+  }
+  return out;
+}
+
+async function main() {
+  // Listing outside collaborators requires an org owner's token, so the
+  // default GITHUB_TOKEN will not do — the workflow passes ORG_TOKEN.
+  let collaborators;
+  try {
+    collaborators = await paginate(`/orgs/${ORG}/outside_collaborators`);
+  } catch (err) {
+    if (/^403|^404/.test(err.message)) {
+      throw new Error(
+        `Cannot read /orgs/${ORG}/outside_collaborators. This endpoint needs a ` +
+          `token belonging to an org owner with the read:org scope — set it as ` +
+          `the ORG_TOKEN secret.\n\n${err.message}`
+      );
+    }
+    throw err;
+  }
+
+  // Extra people who aren't outside collaborators (e.g. org members).
+  for (const login of INCLUDE) {
+    if (collaborators.some((u) => u.login.toLowerCase() === login.toLowerCase())) continue;
+    const { data } = await api(`/users/${login}`, { allowMissing: true });
+    if (data) collaborators.push(data);
+    else console.warn(`INCLUDE: no GitHub user named ${login}`);
+  }
+
+  const people = collaborators
+    .filter((u) => u.login && u.type !== "Bot" && !EXCLUDE.has(u.login.toLowerCase()))
+    .sort((a, b) => a.login.toLowerCase().localeCompare(b.login.toLowerCase()));
+
+  // Profile details for the card captions.
+  for (const person of people) {
+    const { data } = await api(`/users/${person.login}`, { allowMissing: true });
+    person.name = data?.name || person.login;
+    person.bio = (data?.bio || "").replace(/\s+/g, " ").trim();
+  }
+
+  console.log(`${people.length} collaborators in ${ORG}`);
+
+  await writeAvatars(people);
+
+  const { dirname, relative } = await import("node:path");
+  for (const path of README_PATHS) {
+    // Relative to each README so the images work locally and on GitHub.
+    const avatarDir = relative(dirname(path), AVATAR_DIR);
+    await writeReadme(path, renderTable(people, avatarDir));
+  }
+}
+
+function renderTable(people, avatarDir) {
+  if (people.length === 0) {
+    return `_No outside collaborators yet._`;
+  }
+
+  const cell = (p) => {
+    const title = p.bio ? `${p.name} — ${p.bio}` : p.name;
+    return [
+      `      <td align="center" valign="top" width="${Math.floor(100 / PER_ROW)}%">`,
+      `        <a href="${p.html_url}" title="${escapeHtml(title)}">`,
+      `          <img src="${avatarDir}/${p.login.toLowerCase()}.svg" width="${AVATAR}" height="${AVATAR}" alt="${escapeHtml(p.login)}" /><br />`,
+      `          <sub><b>${escapeHtml(p.name)}</b></sub>`,
+      `        </a><br />`,
+      `        <sub>@${escapeHtml(p.login)}</sub>`,
+      `      </td>`,
+    ].join("\n");
+  };
+
+  const rows = [];
+  for (let i = 0; i < people.length; i += PER_ROW) {
+    const chunk = people.slice(i, i + PER_ROW);
+    rows.push(`    <tr>\n${chunk.map(cell).join("\n")}\n    </tr>`);
+  }
+
+  return [
+    `<!-- Generated by .github/workflows/contributors.yml — do not edit by hand. -->`,
+    `<table>`,
+    `  <tbody>`,
+    ...rows,
+    `  </tbody>`,
+    `</table>`,
+  ].join("\n");
+}
+
+// GitHub strips `style` from README HTML, so rounded corners have to be baked
+// into the image: each avatar is embedded in an SVG with a rounded clip.
+async function writeAvatars(people) {
+  const fs = await import("node:fs/promises");
+  await fs.mkdir(AVATAR_DIR, { recursive: true });
+
+  const keep = new Set();
+  for (const p of people) {
+    const res = await fetch(`${p.avatar_url}${p.avatar_url.includes("?") ? "&" : "?"}s=${AVATAR * 2}`);
+    if (!res.ok) throw new Error(`${res.status} fetching avatar for ${p.login}`);
+    const type = res.headers.get("content-type") || "image/png";
+    const data = Buffer.from(await res.arrayBuffer()).toString("base64");
+    const file = `${p.login.toLowerCase()}.svg`;
+    keep.add(file);
+    await fs.writeFile(
+      `${AVATAR_DIR}/${file}`,
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${AVATAR}" height="${AVATAR}" viewBox="0 0 ${AVATAR} ${AVATAR}">` +
+        `<clipPath id="r"><rect width="${AVATAR}" height="${AVATAR}" rx="${RADIUS}"/></clipPath>` +
+        `<image href="data:${type};base64,${data}" width="${AVATAR}" height="${AVATAR}" clip-path="url(#r)"/>` +
+        `</svg>\n`
+    );
+  }
+
+  // Drop avatars of people who are no longer listed.
+  for (const file of await fs.readdir(AVATAR_DIR)) {
+    if (!keep.has(file)) await fs.rm(`${AVATAR_DIR}/${file}`);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+async function writeReadme(path, section) {
+  const fs = await import("node:fs/promises");
+
+  let readme;
+  try {
+    readme = await fs.readFile(path, "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      console.log(`Skipping ${path} (does not exist)`);
+      return;
+    }
+    throw err;
+  }
+
+  if (!readme.includes(START) || !readme.includes(END)) {
+    throw new Error(`${path} is missing the ${START} / ${END} markers`);
+  }
+
+  const updated = readme.replace(
+    new RegExp(`${START}[\\s\\S]*?${END}`),
+    `${START}\n\n${section}\n\n${END}`
+  );
+
+  if (updated === readme) {
+    console.log(`${path} already up to date`);
+    return;
+  }
+  await fs.writeFile(path, updated);
+  console.log(`Updated ${path}`);
+}
+
+main().catch((err) => {
+  console.error(err.message || err);
+  process.exit(1);
+});
